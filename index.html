@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interactive Fractal</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+  canvas {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    cursor: crosshair; touch-action: none;
+  }
+  canvas.grab { cursor: grabbing; }
+  #panel {
+    position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%);
+    box-sizing: border-box; width: min(780px, calc(100vw - 24px)); padding: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+    background: rgba(10, 12, 20, .7); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, .12); border-radius: 14px;
+    color: #dfe3f0; font: 13px/1.3 system-ui, -apple-system, sans-serif;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #panel.min #presets, #panel.min #help { display: none; }
+  button, select, #rule {
+    padding: 7px 11px; color: inherit; background: rgba(255, 255, 255, .06);
+    border: 1px solid transparent; border-radius: 9px; font: inherit; cursor: pointer;
+  }
+  button:hover, select:hover { background: rgba(255, 255, 255, .14); }
+  button.on { border-color: rgba(255, 255, 255, .5); background: rgba(255, 255, 255, .18); }
+  select option { color: #000; }
+  #rule {
+    flex: 1; min-width: 150px; cursor: text; outline: none;
+    font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em;
+    border-color: rgba(255, 255, 255, .2);
+  }
+  #rule:focus { border-color: rgba(255, 255, 255, .6); }
+  #rule.err { border-color: #ff5d6c; }
+  #presets button { padding: 5px 9px; font-size: 12px; }
+  #help { font-size: 12px; color: rgba(223, 227, 240, .6); }
+  #help.err { color: #ff8a95; }
+  #help code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: #dfe3f0; }
+  #hint {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    color: rgba(255, 255, 255, .75); font: 13px system-ui, -apple-system, sans-serif;
+    text-shadow: 0 1px 4px #000; pointer-events: none; transition: opacity 1s;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Move the mouse to morph · drag to pan · scroll to zoom · click to freeze</div>
+<div id="panel">
+  <div class="row">
+    <input id="rule" spellcheck="false" autocomplete="off" aria-label="Formula">
+    <button id="freeze">Freeze</button>
+    <button id="reset">Reset view</button>
+    <select id="palette" title="Palette"></select>
+    <select id="iter" title="Iterations"></select>
+    <button id="min" title="Collapse panel">▾</button>
+  </div>
+  <div class="row" id="presets"></div>
+  <div id="help"></div>
+</div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+out vec2 vUv;
+void main() {
+  // a single full-screen triangle, no buffers
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2. - 1., 0, 1);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform vec2 uCenter, uView, uC;
+uniform float uTime;
+uniform int uIter;
+uniform vec3 uPa, uPb, uPc, uPd;
+in vec2 vUv;
+out vec4 o;
+
+const float PI = 3.14159265359;
+const float BAIL = 1e6, EPS = 1e-10;
+
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+vec2 cdiv(vec2 a, vec2 b) {
+  return vec2(a.x * b.x + a.y * b.y, a.y * b.x - a.x * b.y) / max(dot(b, b), 1e-30);
+}
+// the clamps keep exp/sinh/cosh from overflowing into inf * 0 = NaN
+vec2 cexp(vec2 a) { return exp(min(a.x, 85.)) * vec2(cos(a.y), sin(a.y)); }
+vec2 clog(vec2 a) { return vec2(.5 * log(max(dot(a, a), 1e-30)), atan(a.y, a.x)); }
+vec2 cpow(vec2 a, vec2 b) { return dot(a, a) == 0. ? vec2(0) : cexp(cmul(b, clog(a))); }
+vec2 cpowi(vec2 a, int n) {
+  vec2 r = a;
+  for (int i = 1; i < n; i++) r = cmul(r, a);
+  return r;
+}
+vec2 csqrt(vec2 a) { return cpow(a, vec2(.5, 0)); }
+vec2 csin(vec2 a) { float y = clamp(a.y, -85., 85.); return vec2(sin(a.x) * cosh(y), cos(a.x) * sinh(y)); }
+vec2 ccos(vec2 a) { float y = clamp(a.y, -85., 85.); return vec2(cos(a.x) * cosh(y), -sin(a.x) * sinh(y)); }
+vec2 ctan(vec2 a) { return cdiv(csin(a), ccos(a)); }
+vec2 csinh(vec2 a) { float x = clamp(a.x, -85., 85.); return vec2(sinh(x) * cos(a.y), cosh(x) * sin(a.y)); }
+vec2 ccosh(vec2 a) { float x = clamp(a.x, -85., 85.); return vec2(cosh(x) * cos(a.y), sinh(x) * sin(a.y)); }
+vec2 ctanh(vec2 a) { return cdiv(csinh(a), ccosh(a)); }
+vec2 cabs(vec2 a) { return vec2(length(a), 0); }
+vec2 carg(vec2 a) { return vec2(atan(a.y, a.x), 0); }
+vec2 cconj(vec2 a) { return vec2(a.x, -a.y); }
+vec2 cre(vec2 a) { return vec2(a.x, 0); }
+vec2 cim(vec2 a) { return vec2(a.y, 0); }
+vec2 cfold(vec2 a) { return abs(a); }
+
+vec3 pal(float t) { return uPa + uPb * cos(2. * PI * (uPc * t + uPd)); }
+
+void main() {
+  vec2 p = uCenter + (vUv - .5) * uView;
+  vec2 z = p, c = uC, t = vec2(uTime, 0);
+  // s is a smooth iteration count that works for any formula, trap is the closest approach to 0
+  float s = 0., trap = 1e9, d2 = 1., d2p = 1.;
+  bool escaped = false, converged = false;
+  int i;
+  for (i = 0; i < uIter; i++) {
+    vec2 zp = z;
+    z = /*F*/;
+    float r2 = dot(z, z);
+    if (!(r2 < BAIL)) { escaped = true; break; }
+    s += exp(-sqrt(r2));
+    trap = min(trap, r2);
+    d2p = d2;
+    d2 = dot(z - zp, z - zp);
+    if (d2 < EPS) { converged = true; break; }
+  }
+
+  vec3 col;
+  if (escaped) {
+    col = pal(sqrt(s) * .32 + .55) * (1. - exp(-s * 1.4));
+  } else if (converged) {
+    // Newton-like basins: hue is the root's direction, brightness is how fast we got there
+    float it = float(i) + clamp(log(d2p / EPS) / log(max(d2p / max(d2, 1e-30), 1.0001)), 0., 1.);
+    col = pal(atan(z.y, z.x) / (2. * PI) + .5) * (.12 + .88 * exp(-it * .05));
+  } else {
+    col = pal(sqrt(sqrt(trap)) * .6 + .1) * .22;
+  }
+  o = vec4(col, 1);
+}
+</script>
+
+<script>
+// name, formula, c (re, im), view centre (re, im), view height
+const PRESETS = [
+  ['Dragon', 'z^2 + c', -.8, .156, 0, 0, 2.6],
+  ['Rabbit', 'z^2 + c', -.123, .745, 0, 0, 2.8],
+  ['Galaxies', 'z^2 + c', -.7269, .1889, 0, 0, 2.6],
+  ['Lightning', 'z^2 + c', 0, 1, 0, 0, 2.8],
+  ['Mandelbrot', 'z^2 + p + c', 0, 0, -.6, 0, 2.8],
+  ['Trefoil', 'z^3 + c', .4, 0, 0, 0, 2.6],
+  ['Burning Ship', 'fold(z)^2 + c', .6, -1, 0, 0, 3.4],
+  ['Tricorn', 'conj(z)^2 + c', .25, -.55, 0, 0, 3],
+  ['Sine', 'c*sin(z)', 1, .4, 0, 0, 9],
+  ['Cosh', 'c*cosh(z)', .4, 1.2, 0, 0, 9],
+  ['Rings', 'z^2 + c/z^3', .05, .05, 0, 0, 2.8],
+  ['Newton', 'z - c(z^3-1)/(3z^2)', 1, 0, 0, 0, 3.4],
+  ['Whirlpool', 'z - c(z^5-1)/(5z^4)', 1, .6, 0, 0, 3.4],
+  ['Magnet', '((z^2+c-1)/(2z+c-2))^2', 1.2, 1.5, 0, 0, 5],
+  ['Breathing', 'z^2 + c + 0.06*exp(i*t)', -.75, .1, 0, 0, 2.6],
+];
+// cosine palettes: a + b * cos(2π(c·t + d))
+const PALETTES = {
+  Aurora: [[.5, .5, .5], [.5, .5, .5], [1, 1, 1], [.55, .4, .25]],
+  Fire: [[.5, .4, .3], [.5, .4, .3], [1, .8, .6], [.5, .58, .68]],
+  Ice: [[.45, .55, .65], [.45, .45, .35], [.8, .8, .6], [.6, .52, .45]],
+  Neon: [[.5, .5, .5], [.5, .5, .5], [2, 1, 1], [.5, .2, .25]],
+  Candy: [[.6, .5, .55], [.4, .4, .4], [1, 1, .5], [.8, .9, .3]],
+  Mono: [[.5, .5, .5], [.5, .5, .5], [1, 1, 1], [.5, .5, .5]],
+};
+const HELP = 'Iterates <code>z → f(z)</code> from every pixel. <code>c</code> follows the mouse, <code>p</code> is the pixel, '
+  + '<code>t</code> is time; also <code>i pi e</code> and <code>sin cos tan sinh cosh tanh exp log sqrt abs arg conj re im fold</code>. '
+  + 'Shift — fine control. <code id="cval"></code>';
+const FUNCS = ['sin', 'cos', 'tan', 'sinh', 'cosh', 'tanh', 'exp', 'log', 'sqrt', 'abs', 'arg', 'conj', 're', 'im', 'fold'];
+const CONSTS = {
+  z: 'z', c: 'c', p: 'p', t: 't', i: 'vec2(0, 1)',
+  pi: 'vec2(3.14159265359, 0)', e: 'vec2(2.71828182846, 0)',
+};
+const MIN_SCALE = 1e-4, MAX_SCALE = 60; // below MIN_SCALE float32 runs out of digits
+const C_LIMIT = 4;
+
+const $ = id => document.getElementById(id);
+const canvas = $('c'), panel = $('panel'), ruleInput = $('rule'), help = $('help'), hint = $('hint');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+
+let prog, usesTime = false, dirty = true, frozen = false, preset = PRESETS[0];
+let view = { x: 0, y: 0, scale: 3 };
+let c = { x: 0, y: 0 }, cTarget = { x: 0, y: 0 }; // c eases towards cTarget
+let palette = 'Aurora', iterations = 200;
+
+// formula → GLSL expression over vec2 complex numbers (recursive descent)
+function compileFormula(src) {
+  const toks = src.toLowerCase().match(/\d*\.?\d+|[a-z]+|\S/g) || [];
+  let pos = 0, time = false;
+  const peek = () => toks[pos];
+  const startsPrimary = t => t !== undefined && /^[\d.a-z(]/.test(t);
+  const call = (f, ...a) => ({ code: `${f}(${a.map(n => n.code).join(', ')})` });
+
+  function expr() {
+    let a = term();
+    while (peek() === '+' || peek() === '-') {
+      const op = toks[pos++], b = term();
+      a = { code: `(${a.code} ${op} ${b.code})` };
+    }
+    return a;
+  }
+  function term() {
+    let a = unary();
+    for (;;) {
+      const t = peek();
+      if (t === '*' || t === '/') { pos++; a = call(t === '*' ? 'cmul' : 'cdiv', a, unary()); }
+      else if (startsPrimary(t)) a = call('cmul', a, power()); // implicit: 3z, 2(z+1)
+      else return a;
+    }
+  }
+  function unary() {
+    if (peek() === '-') { pos++; return { code: `(-${unary().code})` }; }
+    if (peek() === '+') { pos++; return unary(); }
+    return power();
+  }
+  function power() {
+    const a = primary();
+    if (peek() !== '^') return a;
+    pos++;
+    const b = unary();
+    // small integer powers by repeated multiplication: exact and free of branch cuts
+    return b.int >= 1 && b.int <= 16 ? { code: `cpowi(${a.code}, ${b.int})` } : call('cpow', a, b);
+  }
+  function primary() {
+    const t = toks[pos++];
+    if (t === undefined) throw 'The formula ends unexpectedly';
+    if (/^[\d.]/.test(t)) {
+      if (t === '.') throw 'Cannot parse "."';
+      const v = +t;
+      return { code: `vec2(${Number.isInteger(v) ? v + '.' : v}, 0)`, int: Number.isInteger(v) ? v : undefined };
+    }
+    if (t === '(') {
+      const a = expr();
+      if (toks[pos++] !== ')') throw 'Missing ")"';
+      return { code: a.code };
+    }
+    if (/^[a-z]+$/.test(t)) {
+      if (FUNCS.includes(t)) {
+        if (toks[pos++] !== '(') throw `${t} must be followed by "("`;
+        const a = expr();
+        if (toks[pos++] !== ')') throw 'Missing ")"';
+        return call('c' + t, a);
+      }
+      if (t in CONSTS) { time ||= t === 't'; return { code: CONSTS[t] }; }
+      throw `Unknown name "${t}"`;
+    }
+    throw `Cannot parse "${t}"`;
+  }
+
+  if (!toks.length) throw 'Type a formula, e.g. z^2 + c';
+  const res = expr();
+  if (pos < toks.length) throw `Cannot parse "${toks[pos]}"`;
+  return { code: res.code, time };
+}
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function program(formula) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, $('vs').textContent));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, $('fs').textContent.replace('/*F*/', formula)));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const loc = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    loc[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, loc };
+}
+
+function setFormula(str) {
+  let next, time;
+  try {
+    const f = compileFormula(str);
+    next = program(f.code);
+    time = f.time;
+  } catch (e) {
+    ruleInput.classList.add('err');
+    help.classList.add('err');
+    help.textContent = e.message ?? e;
+    return;
+  }
+  ruleInput.classList.remove('err');
+  help.classList.remove('err');
+  help.innerHTML = HELP;
+  if (prog) gl.deleteProgram(prog.p);
+  prog = next;
+  usesTime = time;
+  dirty = true;
+}
+
+function setPreset(p) {
+  preset = p;
+  ruleInput.value = p[1];
+  setFormula(p[1]);
+  // c glides to the preset's value, so presets sharing a formula morph into each other
+  cTarget = { x: p[2], y: p[3] };
+  view = { x: p[4], y: p[5], scale: p[6] };
+  setFrozen(false);
+  markPreset();
+}
+
+function markPreset() {
+  [...$('presets').children].forEach((b, i) => b.classList.toggle('on', PRESETS[i] === preset));
+}
+
+function resetView() {
+  view = preset ? { x: preset[4], y: preset[5], scale: preset[6] } : { x: 0, y: 0, scale: 3 };
+  dirty = true;
+}
+
+function setFrozen(v) {
+  frozen = v;
+  $('freeze').textContent = frozen ? 'Unfreeze' : 'Freeze';
+  $('freeze').classList.toggle('on', frozen);
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  dirty = true;
+}
+
+function draw(time) {
+  const u = prog.loc, pl = PALETTES[palette];
+  gl.useProgram(prog.p);
+  gl.uniform2f(u.uCenter, view.x, view.y);
+  gl.uniform2f(u.uView, view.scale * innerWidth / innerHeight, view.scale);
+  gl.uniform2f(u.uC, c.x, c.y);
+  gl.uniform1f(u.uTime, time / 1000);
+  gl.uniform1i(u.uIter, iterations);
+  gl.uniform3fv(u.uPa, pl[0]);
+  gl.uniform3fv(u.uPb, pl[1]);
+  gl.uniform3fv(u.uPc, pl[2]);
+  gl.uniform3fv(u.uPd, pl[3]);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const el = $('cval');
+  if (el) el.textContent = `c = ${c.x.toFixed(4)} ${c.y < 0 ? '−' : '+'} ${Math.abs(c.y).toFixed(4)}i`;
+}
+
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+// the mouse moves c relatively, so a preset's c is a starting point rather than something to jump away from
+function nudgeC(dx, dy, fine) {
+  if (frozen) return;
+  const k = (fine ? .1 : 1) * 1.6 / Math.min(innerWidth, innerHeight);
+  cTarget.x = clamp(cTarget.x + dx * k, -C_LIMIT, C_LIMIT);
+  cTarget.y = clamp(cTarget.y - dy * k, -C_LIMIT, C_LIMIT);
+}
+
+function pan(dx, dy) {
+  const k = view.scale / innerHeight;
+  view.x -= dx * k;
+  view.y += dy * k;
+  dirty = true;
+}
+
+// zoom keeping the point under (px, py) in place
+function zoom(factor, px, py) {
+  const scale = clamp(view.scale * factor, MIN_SCALE, MAX_SCALE);
+  const k = (view.scale - scale) / innerHeight;
+  view.x += (px - innerWidth / 2) * k;
+  view.y -= (py - innerHeight / 2) * k;
+  view.scale = scale;
+  dirty = true;
+}
+
+function init() {
+  if (!gl) {
+    help.textContent = 'This browser does not support WebGL 2.';
+    help.classList.add('err');
+    return;
+  }
+
+  for (const p of PRESETS) {
+    const b = document.createElement('button');
+    b.textContent = p[0];
+    b.title = p[1];
+    b.addEventListener('click', () => setPreset(p));
+    $('presets').appendChild(b);
+  }
+  for (const n of Object.keys(PALETTES)) $('palette').add(new Option(n, n, false, n === palette));
+  for (const n of [100, 200, 400, 800]) $('iter').add(new Option(`${n} iter`, n, false, n === iterations));
+
+  setPreset(preset);
+  c = { ...cTarget };
+  resize();
+
+  ruleInput.addEventListener('input', () => { preset = null; markPreset(); setFormula(ruleInput.value); });
+  $('freeze').addEventListener('click', () => setFrozen(!frozen));
+  $('reset').addEventListener('click', resetView);
+  $('palette').addEventListener('change', e => { palette = e.target.value; dirty = true; });
+  $('iter').addEventListener('change', e => { iterations = +e.target.value; dirty = true; });
+  $('min').addEventListener('click', () => {
+    $('min').textContent = panel.classList.toggle('min') ? '▴' : '▾';
+  });
+  addEventListener('resize', resize);
+
+  addEventListener('keydown', e => {
+    if (e.target === ruleInput) return;
+    if (e.code === 'Space') { e.preventDefault(); setFrozen(!frozen); }
+    else if (e.code === 'KeyR') resetView();
+  });
+
+  // mouse: hover morphs, drag pans. touch: one finger morphs, two fingers pan and zoom
+  const pts = new Map();
+  let hover = null, moved = 0;
+  const pinch = () => {
+    const [a, b] = [...pts.values()];
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) };
+  };
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    ruleInput.blur();
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    moved = 0;
+    hint.style.opacity = 0;
+  });
+  canvas.addEventListener('pointermove', e => {
+    const pt = pts.get(e.pointerId);
+    if (!pt) {
+      if (e.pointerType === 'mouse') {
+        if (hover) nudgeC(e.clientX - hover.x, e.clientY - hover.y, e.shiftKey);
+        hover = { x: e.clientX, y: e.clientY };
+      }
+      return;
+    }
+    const dx = e.clientX - pt.x, dy = e.clientY - pt.y;
+    moved += Math.abs(dx) + Math.abs(dy);
+    if (pts.size === 2) {
+      const before = pinch();
+      pt.x = e.clientX; pt.y = e.clientY;
+      const after = pinch();
+      pan(after.x - before.x, after.y - before.y);
+      zoom(before.d / Math.max(after.d, 1), after.x, after.y);
+      return;
+    }
+    pt.x = e.clientX; pt.y = e.clientY;
+    if (e.pointerType === 'mouse') {
+      canvas.classList.add('grab');
+      pan(dx, dy);
+    } else nudgeC(dx, dy, false);
+  });
+  const up = e => {
+    if (!pts.delete(e.pointerId)) return;
+    canvas.classList.remove('grab');
+    hover = e.pointerType === 'mouse' ? { x: e.clientX, y: e.clientY } : null;
+    // a click without a drag freezes c in place
+    if (e.type === 'pointerup' && e.pointerType === 'mouse' && moved < 4) setFrozen(!frozen);
+  };
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+  canvas.addEventListener('pointerleave', () => hover = null);
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    // trackpad pinch arrives as ctrl+wheel with tiny deltas
+    zoom(Math.exp(e.deltaY * (e.ctrlKey ? .01 : .0015)), e.clientX, e.clientY);
+    hint.style.opacity = 0;
+  }, { passive: false });
+
+  function loop(time) {
+    const dx = cTarget.x - c.x, dy = cTarget.y - c.y;
+    if (Math.abs(dx) + Math.abs(dy) > 1e-6) {
+      c.x += dx * .16;
+      c.y += dy * .16;
+      dirty = true;
+    }
+    // nothing changes between frames unless something moved or the formula depends on time
+    if (dirty || usesTime) {
+      dirty = false;
+      draw(time);
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+
+init();
+</script>
+</body>
+</html>
