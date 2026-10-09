@@ -2,7 +2,7 @@
 
 A full-screen fractal explorer in a single HTML file (WebGL 2, no dependencies).
 
-**Live:** https://mkotenkov.github.io/interactive-fractal/
+**Live:** https://ktnkv.github.io/interactive-fractal/
 
 Type any complex formula `z → f(z)` and it is compiled into a shader on the fly.
 
